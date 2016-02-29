@@ -116,7 +116,6 @@ static void on_connect(grpc_exec_ctx *exec_ctx, void *acp, bool from_iocp) {
      the deadline was met. */
   on_done->cb(exec_ctx, on_done->cb_arg, *ep != NULL);
 }
-
 /* Tries to issue one async connection, then schedules both an IOCP
    notification request for the connection, and one timeout alert. */
 void grpc_tcp_client_connect(grpc_exec_ctx *exec_ctx, grpc_closure *on_done,
@@ -127,8 +126,6 @@ void grpc_tcp_client_connect(grpc_exec_ctx *exec_ctx, grpc_closure *on_done,
   SOCKET sock = INVALID_SOCKET;
   BOOL success;
   int status;
-  struct sockaddr_in6 addr6_v4mapped;
-  struct sockaddr_in6 local_address;
   async_connect *ac;
   grpc_winsocket *socket = NULL;
   LPFN_CONNECTEX ConnectEx;
@@ -140,13 +137,7 @@ void grpc_tcp_client_connect(grpc_exec_ctx *exec_ctx, grpc_closure *on_done,
 
   *endpoint = NULL;
 
-  /* Use dualstack sockets where available. */
-  if (grpc_sockaddr_to_v4mapped(addr, &addr6_v4mapped)) {
-    addr = (const struct sockaddr *)&addr6_v4mapped;
-    addr_len = sizeof(addr6_v4mapped);
-  }
-
-  sock = WSASocket(AF_INET6, SOCK_STREAM, IPPROTO_TCP, NULL, 0,
+  sock = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0,
                    WSA_FLAG_OVERLAPPED);
   if (sock == INVALID_SOCKET) {
     message = "Unable to create socket: %s";
@@ -169,13 +160,18 @@ void grpc_tcp_client_connect(grpc_exec_ctx *exec_ctx, grpc_closure *on_done,
     goto failure;
   }
 
-  grpc_sockaddr_make_wildcard6(0, &local_address);
-
-  status = bind(sock, (struct sockaddr *)&local_address, sizeof(local_address));
-  if (status != 0) {
-    message = "Unable to bind socket: %s";
-    goto failure;
-  }
+	  {
+		  struct sockaddr_in addr;
+		  ZeroMemory(&addr, sizeof(addr));
+		  addr.sin_family = AF_INET;
+		  addr.sin_addr.s_addr = INADDR_ANY;
+		  addr.sin_port = 0;
+		  int rc = bind(sock, (SOCKADDR*)&addr, sizeof(addr));
+		  if (rc != 0) {
+			  message = "bind failed: %s";
+			  goto failure;
+		  }
+	  }
 
   socket = grpc_winsocket_create(sock, "client");
   info = &socket->write_info;
