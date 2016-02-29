@@ -260,7 +260,7 @@ static void start_accept(grpc_exec_ctx *exec_ctx, grpc_tcp_listener *port) {
   DWORD addrlen = sizeof(struct sockaddr_in6) + 16;
   DWORD bytes_received = 0;
 
-  sock = WSASocket(AF_INET6, SOCK_STREAM, IPPROTO_TCP, NULL, 0,
+  sock = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0,
                    WSA_FLAG_OVERLAPPED);
 
   if (sock == INVALID_SOCKET) {
@@ -448,8 +448,6 @@ int grpc_tcp_server_add_port(grpc_tcp_server *s, const void *addr,
                              size_t addr_len) {
   grpc_tcp_listener *sp;
   SOCKET sock;
-  struct sockaddr_in6 addr6_v4mapped;
-  struct sockaddr_in6 wildcard;
   struct sockaddr *allocated_addr = NULL;
   struct sockaddr_storage sockname_temp;
   socklen_t sockname_len;
@@ -478,20 +476,7 @@ int grpc_tcp_server_add_port(grpc_tcp_server *s, const void *addr,
     }
   }
 
-  if (grpc_sockaddr_to_v4mapped(addr, &addr6_v4mapped)) {
-    addr = (const struct sockaddr *)&addr6_v4mapped;
-    addr_len = sizeof(addr6_v4mapped);
-  }
-
-  /* Treat :: or 0.0.0.0 as a family-agnostic wildcard. */
-  if (grpc_sockaddr_is_wildcard(addr, &port)) {
-    grpc_sockaddr_make_wildcard6(port, &wildcard);
-
-    addr = (struct sockaddr *)&wildcard;
-    addr_len = sizeof(wildcard);
-  }
-
-  sock = WSASocket(AF_INET6, SOCK_STREAM, IPPROTO_TCP, NULL, 0,
+  sock = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0,
                    WSA_FLAG_OVERLAPPED);
   if (sock == INVALID_SOCKET) {
     char *utf8_message = gpr_format_message(WSAGetLastError());
