@@ -41,9 +41,19 @@ typedef struct {
   int locked;
 } gpr_mu;
 
-typedef CONDITION_VARIABLE gpr_cv;
+typedef struct cnd_t {
+	int blocked;
+	int gone;
+	int to_unblock;
+	HANDLE sem_queue;
+	HANDLE sem_gate;
+	CRITICAL_SECTION monitor;
+} gpr_cv;
 
-typedef INIT_ONCE gpr_once;
+typedef struct once_flag_t {
+	volatile LONG status;
+} gpr_once;
+
 #define GPR_ONCE_INIT INIT_ONCE_STATIC_INIT
 
 #endif /* GRPC_IMPL_CODEGEN_SYNC_WIN32_H */
