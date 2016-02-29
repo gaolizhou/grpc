@@ -36,10 +36,10 @@
 #include <grpc/support/port_platform.h>
 
 #ifdef GPR_WIN32
-
 #include <grpc/support/log.h>
 #include <grpc/support/sync.h>
 #include <grpc/support/time.h>
+#include <stdio.h>
 
 void gpr_mu_init(gpr_mu *mu) {
   InitializeCriticalSection(&mu->cs);
@@ -72,11 +72,23 @@ int gpr_mu_trylock(gpr_mu *mu) {
 }
 
 /*----------------------------------------*/
+static void impl_cond_do_signal(gpr_cv *cond, int broadcast);
+static BOOL impl_cond_do_wait(gpr_cv *cond, CRITICAL_SECTION *mtx, DWORD timeout_max_ms);
 
-void gpr_cv_init(gpr_cv *cv) { InitializeConditionVariable(cv); }
+void gpr_cv_init(gpr_cv *cv) { 
+	cv->blocked = 0;
+	cv->gone = 0;
+	cv->to_unblock = 0;
+	cv->sem_queue = CreateSemaphore(NULL, 0, LONG_MAX, NULL);
+	cv->sem_gate = CreateSemaphore(NULL, 1, 1, NULL);
+	InitializeCriticalSection(&cv->monitor);
+
+}
 
 void gpr_cv_destroy(gpr_cv *cv) {
   /* Condition variables don't need destruction in Win32. */
+	CloseHandle(cv->sem_queue);
+	CloseHandle(cv->sem_gate);
 }
 
 int gpr_cv_wait(gpr_cv *cv, gpr_mu *mu, gpr_timespec abs_deadline) {
@@ -85,7 +97,7 @@ int gpr_cv_wait(gpr_cv *cv, gpr_mu *mu, gpr_timespec abs_deadline) {
   mu->locked = 0;
   if (gpr_time_cmp(abs_deadline, gpr_inf_future(abs_deadline.clock_type)) ==
       0) {
-    SleepConditionVariableCS(cv, &mu->cs, INFINITE);
+		impl_cond_do_wait(cv, &mu->cs, INFINITE);
   } else {
     abs_deadline = gpr_convert_clock_type(abs_deadline, GPR_CLOCK_REALTIME);
     gpr_timespec now = gpr_now(abs_deadline.clock_type);
@@ -100,7 +112,7 @@ int gpr_cv_wait(gpr_cv *cv, gpr_mu *mu, gpr_timespec abs_deadline) {
       } else {
         timeout_max_ms = (DWORD)(deadline_ms - now_ms);
       }
-      timeout = (SleepConditionVariableCS(cv, &mu->cs, timeout_max_ms) == 0 &&
+      timeout = (impl_cond_do_wait(cv, &mu->cs, timeout_max_ms) == 0 &&
                  GetLastError() == ERROR_TIMEOUT);
     }
   }
@@ -108,26 +120,118 @@ int gpr_cv_wait(gpr_cv *cv, gpr_mu *mu, gpr_timespec abs_deadline) {
   return timeout;
 }
 
-void gpr_cv_signal(gpr_cv *cv) { WakeConditionVariable(cv); }
+void gpr_cv_signal(gpr_cv *cv) {
+	impl_cond_do_signal(cv, 0);
+}
 
-void gpr_cv_broadcast(gpr_cv *cv) { WakeAllConditionVariable(cv); }
+void gpr_cv_broadcast(gpr_cv *cv) {
+	impl_cond_do_signal(cv, 1);
+}
 
 /*----------------------------------------*/
 
-static void *dummy;
-struct run_once_func_arg {
-  void (*init_function)(void);
-};
-static BOOL CALLBACK run_once_func(gpr_once *once, void *v, void **pv) {
-  struct run_once_func_arg *arg = v;
-  (*arg->init_function)();
-  return 1;
+void gpr_once_init(gpr_once *flag, void(*init_function)(void)) {
+  if (InterlockedCompareExchange(&flag->status, 1, 0) == 0) {
+	  (init_function)();
+	  InterlockedExchange(&flag->status, 2);
+  } else {
+	  while (flag->status == 1) {
+		  SwitchToThread();
+	  }
+  }
+
 }
 
-void gpr_once_init(gpr_once *once, void (*init_function)(void)) {
-  struct run_once_func_arg arg;
-  arg.init_function = init_function;
-  InitOnceExecuteOnce(once, run_once_func, &arg, &dummy);
+
+
+static void impl_cond_do_signal(gpr_cv *cond, int broadcast)
+{
+	int nsignal = 0;
+
+	EnterCriticalSection(&cond->monitor);
+	if (cond->to_unblock != 0) {
+		if (cond->blocked == 0) {
+			LeaveCriticalSection(&cond->monitor);
+			return;
+		}
+		if (broadcast) {
+			cond->to_unblock += nsignal = cond->blocked;
+			cond->blocked = 0;
+		} else {
+			nsignal = 1;
+			cond->to_unblock++;
+			cond->blocked--;
+		}
+	} else if (cond->blocked > cond->gone) {
+		WaitForSingleObject(cond->sem_gate, INFINITE);
+		if (cond->gone != 0) {
+			cond->blocked -= cond->gone;
+			cond->gone = 0;
+		}
+		if (broadcast) {
+			nsignal = cond->to_unblock = cond->blocked;
+			cond->blocked = 0;
+		} else {
+			nsignal = cond->to_unblock = 1;
+			cond->blocked--;
+		}
+	}
+	LeaveCriticalSection(&cond->monitor);
+
+	if (0 < nsignal)
+		ReleaseSemaphore(cond->sem_queue, nsignal, NULL);
 }
+
+static BOOL impl_cond_do_wait(gpr_cv *cond, CRITICAL_SECTION *mtx, DWORD timeout_max_ms)
+{
+	int nleft = 0;
+	int ngone = 0;
+	BOOL timeout = 0;
+	DWORD w;
+
+	WaitForSingleObject(cond->sem_gate, INFINITE);
+	cond->blocked++;
+	ReleaseSemaphore(cond->sem_gate, 1, NULL);
+
+	EnterCriticalSection(mtx);
+
+	w = WaitForSingleObject(cond->sem_queue, timeout_max_ms);
+	timeout = (w == WAIT_TIMEOUT);
+
+	EnterCriticalSection(&cond->monitor);
+	if ((nleft = cond->to_unblock) != 0) {
+		if (timeout) {
+			if (cond->blocked != 0) {
+				cond->blocked--;
+			} else {
+				cond->gone++;
+			}
+		}
+		if (--cond->to_unblock == 0) {
+			if (cond->blocked != 0) {
+				ReleaseSemaphore(cond->sem_gate, 1, NULL);
+				nleft = 0;
+			} else if ((ngone = cond->gone) != 0) {
+				cond->gone = 0;
+			}
+		}
+	} else if (++cond->gone == INT_MAX / 2) {
+		WaitForSingleObject(cond->sem_gate, INFINITE);
+		cond->blocked -= cond->gone;
+		ReleaseSemaphore(cond->sem_gate, 1, NULL);
+		cond->gone = 0;
+	}
+	LeaveCriticalSection(&cond->monitor);
+
+	if (nleft == 1) {
+		while (ngone--)
+			WaitForSingleObject(cond->sem_queue, INFINITE);
+		ReleaseSemaphore(cond->sem_gate, 1, NULL);
+	}
+
+	LeaveCriticalSection(mtx);
+	return timeout;
+}
+
 
 #endif /* GPR_WIN32 */
