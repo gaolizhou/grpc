@@ -57,7 +57,7 @@ struct thd_info {
   int joinable;            /* true if not detached */
 };
 
-static thread_local struct thd_info *g_thd_info;
+static struct thd_info *g_thd_info;
 
 /* Destroys a thread info */
 static void destroy_thread(struct thd_info *t) {
